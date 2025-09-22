@@ -53,30 +53,30 @@ calculate_phenological_metrics_batch <- function(dir,
   if (is.null(df_thres)) {
     df_thres <- set_thresholds()
   }
-
+  
   # Create output directory for processed DOY data
   dir.create(file.path(dir, "doy"), showWarnings = FALSE)
-
+  
   v_file <- list.files(file.path(dir, "clean"), recursive = FALSE, full.names = FALSE) %>%
     filter_file_names(v_site, v_group)
-
+  
   cl <- makeCluster(num_cores, outfile = "")
   registerDoSNOW(cl)
-
+  
   foreach(
     file = v_file,
     .packages = c("tidyverse", "batchplanet")
   ) %dopar% {
     f_index <- file.path(dir, "clean", file)
     df_index <- read_rds(f_index)
-
+    
     df_doy <- calculate_phenological_metrics_sitegroup(df_index, df_thres, v_year, min_days, check_seasonality, var_index, extend_to_previous_year, extend_to_next_year)
-
+    
     f_doy <- file.path(dir, "doy", file %>% str_replace("clean_", "doy_"))
     write_rds(df_doy, f_doy, compress = "gz")
   }
   stopCluster(cl)
-
+  
   invisible(NULL)
 }
 
@@ -87,7 +87,7 @@ calculate_phenological_metrics_sitegroup <- function(df_index, df_thres, v_year 
       unique() %>%
       sort()
   }
-
+  
   ls_df_doy_year <- list()
   for (yearoi in v_year) {
     df_index_year <- df_index %>%
@@ -98,12 +98,12 @@ calculate_phenological_metrics_sitegroup <- function(df_index, df_thres, v_year 
       mutate(doy = ifelse(doy <= extend_to_next_year & year == yearoi + 1, doy + 365, doy)) %>%
       mutate(year = ifelse(doy > 365 & year == yearoi + 1, year - 1, year)) %>%
       filter(year == yearoi)
-
+    
     v_id <- df_index %>%
       pull(id) %>%
       unique() %>%
       sort()
-
+    
     ls_df_doy_id <- list()
     for (idoi in v_id) {
       message(str_c("Processing time series for ", yearoi, " ", idoi))
@@ -123,7 +123,7 @@ calculate_phenological_metrics_sitegroup <- function(df_index, df_thres, v_year 
     ls_df_doy_year[[yearoi %>% as.character()]] <- bind_rows(ls_df_doy_id)
   }
   df_doy <- bind_rows(ls_df_doy_year)
-
+  
   return(df_doy)
 }
 
@@ -161,7 +161,7 @@ calculate_phenological_metrics <- function(df_index, df_thres, min_days, check_s
     mutate(index = !!sym(var_index)) %>%
     complete(doy = seq(min(doy), max(doy), 1), fill = list(index = NA)) %>%
     mutate(index_sm = whittaker_smoothing_filling(x = index, maxgap = 60, lambda = 50, minseg = 2))
-
+  
   # Count the number of valid (non-NA) smoothed observations
   valid_days <- df_index %>%
     drop_na(index_sm) %>%
@@ -169,14 +169,14 @@ calculate_phenological_metrics <- function(df_index, df_thres, min_days, check_s
   if (valid_days < min_days) {
     return(NULL)
   }
-
+  
   # Compute a flattened trend indicator using a helper smoothing function
   if (check_seasonality) {
     seasonal <- determine_seasonality(df_index$index_sm, k = 50)
   } else {
     seasonal <- T
   }
-
+  
   ### green down
   thres_list_down <- df_thres %>%
     filter(direction == "down") %>%
@@ -188,18 +188,26 @@ calculate_phenological_metrics <- function(df_index, df_thres, min_days, check_s
       filter(doy >= 60 & doy <= 300) %>%
       arrange(desc(index_sm), doy) %>%
       slice(1)
+    
     max_index <- df_index_max$index_sm
     start_doy <- df_index_max$doy
-
-    df_index_min <- df_index %>%
-      filter(doy >= start_doy) %>%
-      arrange(index_sm, desc(doy)) %>%
-      slice(1)
-    min_index <- df_index_min$index_sm
-    end_doy <- df_index_min$doy
-
-    param_ok2 <- (end_doy > start_doy) & seasonal
-
+    
+    if (length(start_doy)==0) {
+      min_index <- NA
+      end_doy <- NA
+      start_doy <- NA
+    } else {
+      df_index_min <- df_index %>%
+        filter(doy >= start_doy) %>%
+        arrange(index_sm, desc(doy)) %>%
+        slice(1)
+      min_index <- df_index_min$index_sm
+      end_doy <- df_index_min$doy
+    }
+    
+    param_ok2 <- (!is.na(start_doy) && !is.na(end_doy) &&
+                    (end_doy > start_doy) && seasonal)
+    
     if (!param_ok2) {
       greendown_doy <- rep(NA, length(thres_list_down))
       start_doy <- NA
@@ -222,7 +230,7 @@ calculate_phenological_metrics <- function(df_index, df_thres, min_days, check_s
           }
         }
         greendown_thres <- (max_index - min_index) * thres_list_down + min_index
-  
+        
         greendown_doy <- rep(NA, length(greendown_thres))
         for (t in 1:length(greendown_thres)) {
           df_index_doy <- df_index %>%
@@ -234,11 +242,11 @@ calculate_phenological_metrics <- function(df_index, df_thres, min_days, check_s
             arrange(doy) %>%
             slice(1)
           greendown_doy[t] <- df_index_doy$doy
-      }}
+        }}
     }
     df_down <- data.frame(start = start_doy, end = end_doy, direction = "down", thres = thres_list_down, doy = greendown_doy)
   }
-
+  
   ### green up
   thres_list_up <- df_thres %>%
     filter(direction == "up") %>%
@@ -252,16 +260,25 @@ calculate_phenological_metrics <- function(df_index, df_thres, min_days, check_s
       slice(1)
     max_index <- df_index_max$index_sm
     end_doy <- df_index_max$doy
-
-    df_index_min <- df_index %>%
-      filter(doy <= end_doy) %>%
-      arrange(index_sm, desc(doy)) %>%
-      slice(1)
-    min_index <- df_index_min$index_sm
-    start_doy <- df_index_min$doy
-
-    param_ok2 <- (end_doy > start_doy) & seasonal
-
+    
+    
+    if (length(end_doy)==0) {
+      min_index <- NA
+      end_doy <- NA
+      start_doy <- NA
+    } else {
+      df_index_min <- df_index %>%
+        filter(doy <= end_doy) %>%
+        arrange(index_sm, desc(doy)) %>%
+        slice(1)
+      min_index <- df_index_min$index_sm
+      start_doy <- df_index_min$doy
+    }
+    
+    param_ok2 <- (!is.na(start_doy) && !is.na(end_doy) &&
+                    (end_doy > start_doy) && seasonal)
+    
+    
     if (!param_ok2) {
       greenup_doy <- rep(NA, length(thres_list_up))
       start_doy <- NA
@@ -274,34 +291,34 @@ calculate_phenological_metrics <- function(df_index, df_thres, min_days, check_s
         start_doy <- NA
         end_doy <- NA
       } else {
-      for (t in 1:length(thres_list_up)) {
-        if (thres_list_up[t] == 1) {
-          greenup_thres[t] <- max_index
-        } else if (thres_list_up[t] == 0) {
-          greenup_thres[t] <- min_index
-        } else {
-          greenup_thres[t] <- (max_index - min_index) * thres_list_up[t] + min_index
+        for (t in 1:length(thres_list_up)) {
+          if (thres_list_up[t] == 1) {
+            greenup_thres[t] <- max_index
+          } else if (thres_list_up[t] == 0) {
+            greenup_thres[t] <- min_index
+          } else {
+            greenup_thres[t] <- (max_index - min_index) * thres_list_up[t] + min_index
+          }
         }
-      }
-
-      greenup_doy <- rep(NA, length(greenup_thres))
-      for (t in 1:length(greenup_thres)) {
-        df_index_doy <- df_index %>%
-          filter(
-            doy >= start_doy,
-            doy <= end_doy
-          ) %>%
-          filter(index_sm >= greenup_thres[t]) %>%
-          arrange(doy) %>%
-          slice(1)
-        greenup_doy[t] <- df_index_doy$doy
-      }}
+        
+        greenup_doy <- rep(NA, length(greenup_thres))
+        for (t in 1:length(greenup_thres)) {
+          df_index_doy <- df_index %>%
+            filter(
+              doy >= start_doy,
+              doy <= end_doy
+            ) %>%
+            filter(index_sm >= greenup_thres[t]) %>%
+            arrange(doy) %>%
+            slice(1)
+          greenup_doy[t] <- df_index_doy$doy
+        }}
     }
     df_up <- data.frame(start = start_doy, end = end_doy, direction = "up", thres = thres_list_up, doy = greenup_doy)
   }
-
+  
   df_doy <- bind_rows(df_up, df_down)
-
+  
   return(df_doy)
 }
 
@@ -338,6 +355,6 @@ set_thresholds <- function(thres_up = seq(from = 0, to = 1, by = 0.1) %>% round(
     data.frame(direction = "down", threshold = thres_down)
   ) %>%
     drop_na()
-
+  
   return(df_thres)
 }
